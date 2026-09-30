@@ -19,6 +19,7 @@ class DocumentRead(BaseModel):
     created_at: datetime | None
     updated_at: datetime | None
     ingestion_error: str | None = None
+    ingestion_stage: str | None = None
 
     @classmethod
     def from_model(cls, document: Document) -> "DocumentRead":
@@ -38,6 +39,7 @@ class DocumentRead(BaseModel):
             created_at=document.created_at,
             updated_at=document.updated_at,
             ingestion_error=latest_job.error_message if latest_job else None,
+            ingestion_stage=latest_job.stage if latest_job else None,
         )
 
 

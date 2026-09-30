@@ -1,7 +1,10 @@
 "use client";
 
 import { ArrowUpRight, AudioLines, LoaderCircle, Quote, Search, TriangleAlert } from "lucide-react";
+import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
+
+import { useToast } from "@/components/Toast";
 
 const API_BASE = process.env.NEXT_PUBLIC_NEXORA_API ?? "http://localhost:8000/api/v1";
 
@@ -32,6 +35,7 @@ async function responseError(response: Response): Promise<string> {
 }
 
 export function KnowledgeChat() {
+  const { notify } = useToast();
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [mode, setMode] = useState<Mode>("retrieve");
   const [question, setQuestion] = useState("");
@@ -57,7 +61,7 @@ export function KnowledgeChat() {
 
   async function submitQuestion(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!question.trim() || !workspace) return;
+    if (!question.trim() || !workspace || loading) return;
     setLoading(true);
     setError("");
     setAnswer("");
@@ -79,7 +83,9 @@ export function KnowledgeChat() {
         setCitations(result.citations as Citation[]);
       }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "The query could not be completed.");
+      const message = reason instanceof Error ? reason.message : "The query could not be completed.";
+      setError(message);
+      notify("error", message);
     } finally {
       setLoading(false);
     }
@@ -95,6 +101,9 @@ export function KnowledgeChat() {
           {mode === "retrieve"
             ? "Inspect the hybrid retrieval results without configuring a generation provider."
             : "Answers are based on retrieved document excerpts and include source citations."}
+        </p>
+        <p className="chat-hint-link">
+          New here? <Link href="/library">Upload a document</Link> first, then come back and ask about it.
         </p>
         <div className="mode-switch" role="group" aria-label="Query mode">
           <button type="button" className={mode === "retrieve" ? "mode-active" : ""} onClick={() => setMode("retrieve")}>

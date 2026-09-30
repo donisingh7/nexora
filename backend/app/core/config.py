@@ -24,8 +24,14 @@ class Settings(BaseSettings):
 
     groq_api_key: SecretStr | None = None
     groq_model: str = "llama-3.1-8b-instant"
+
+    embedding_provider: Literal["sentence_transformers", "gemini"] = "sentence_transformers"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimensions: Literal[384] = 384
+    gemini_api_key: SecretStr | None = None
+    gemini_embedding_model: str = "gemini-embedding-2"
+
+    ingestion_queue_url: str | None = None
 
     max_upload_size_bytes: int = Field(default=25_000_000, gt=0)
     allowed_upload_mime_types: list[str] = Field(
