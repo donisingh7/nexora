@@ -27,6 +27,10 @@ providers = [
   "boto3>=1.34,<2.0",
   "groq>=0.11,<1.0",
   "sentence-transformers>=3.0,<6.0",
+  "google-genai>=1.0,<2.0",
+]
+aws = [
+  "mangum>=0.17,<1.0",
 ]
 dev = [
   "httpx>=0.27,<1.0",

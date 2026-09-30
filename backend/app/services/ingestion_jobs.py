@@ -27,11 +27,15 @@ def build_recover_stale_statement(threshold: datetime):
 class IngestionJobQueue(Protocol):
     async def claim_next(self) -> IngestionJob | None: ...
 
+    async def claim_job(self, job_id: UUID) -> IngestionJob | None: ...
+
     async def mark_completed(self, job_id: UUID) -> bool: ...
 
     async def mark_failed(self, job_id: UUID, reason: str, *, requeue: bool = False) -> bool: ...
 
     async def recover_stale(self, stale_after_seconds: float) -> int: ...
+
+    async def update_stage(self, job_id: UUID, stage: str) -> None: ...
 
 
 class DatabaseIngestionJobQueue:
@@ -58,6 +62,26 @@ class DatabaseIngestionJobQueue:
         await self._session.commit()
         return job
 
+    async def claim_job(self, job_id: UUID) -> IngestionJob | None:
+        """Claim one specific queued job by id - for an SQS-driven worker, where the
+        message names the job rather than "whatever is next". A redelivered message for
+        a job that is no longer `queued` (already claimed, completed, or failed) returns
+        None rather than erroring, so at-least-once delivery stays idempotent."""
+        statement = (
+            select(IngestionJob)
+            .options(selectinload(IngestionJob.document))
+            .where(IngestionJob.id == job_id, IngestionJob.status == IngestionStatus.QUEUED.value)
+            .with_for_update(skip_locked=True)
+        )
+        job = await self._session.scalar(statement)
+        if job is None:
+            return None
+        job.status = IngestionStatus.PROCESSING.value
+        job.locked_at = datetime.now(UTC)
+        job.attempts += 1
+        await self._session.commit()
+        return job
+
     async def mark_completed(self, job_id: UUID) -> bool:
         return await self._finish(job_id, IngestionStatus.COMPLETED.value, None)
 
@@ -71,6 +95,19 @@ class DatabaseIngestionJobQueue:
         result = await self._session.execute(build_recover_stale_statement(threshold))
         await self._session.commit()
         return result.rowcount
+
+    async def update_stage(self, job_id: UUID, stage: str) -> None:
+        """Record progress within `processing`, for UI feedback only. Guarded to
+        `processing` so a stale/duplicate call can never resurrect a finished job."""
+        await self._session.execute(
+            update(IngestionJob)
+            .where(
+                IngestionJob.id == job_id,
+                IngestionJob.status == IngestionStatus.PROCESSING.value,
+            )
+            .values(stage=stage)
+        )
+        await self._session.commit()
 
     async def _finish(self, job_id: UUID, status: str, reason: str | None) -> bool:
         job_result = await self._session.execute(

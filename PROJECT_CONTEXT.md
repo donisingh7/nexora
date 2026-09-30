@@ -6,13 +6,14 @@ Nexora is an independently built enterprise knowledge intelligence foundation. T
 
 ## Current stack
 
-- `frontend/`: Next.js App Router, TypeScript, React, lucide-react.
+- `frontend/`: Next.js App Router, TypeScript, React, lucide-react. A `ToastProvider` (`src/components/Toast.tsx`) wraps the app in `layout.tsx` for success/error notifications.
 - `backend/`: Python 3.11+, FastAPI, Pydantic Settings, async SQLAlchemy, asyncpg, Alembic, pgvector.
-- Storage adapters: local filesystem default and optional S3.
-- Provider protocols: text generation, embeddings, and retrieval. Groq and sentence-transformers adapters are optional dependencies.
+- Storage adapters: local filesystem default and S3 (production-ready via the AWS SDK default credential chain).
+- Provider protocols: text generation (Groq), embeddings (sentence-transformers local / Gemini serverless), retrieval, and ingestion-job publishing (Noop local / SQS serverless). All optional/swappable via `EMBEDDING_PROVIDER`, `INGESTION_QUEUE_URL`.
 - PostgreSQL is the authoritative store. The initial embedding column is fixed at 384 dimensions.
+- AWS Lambda entry points exist but are not deployed: `backend/app/main_lambda.py` (API, via Mangum) and `backend/app/workers/lambda_handler.py` (SQS-triggered worker). See `backend/lambda/README.md`.
 
-## Existing contracts (after S3)
+## Existing contracts (after S4/ND-02)
 
 - Health endpoints at `/health`, `/ready`, and `/api/v1` aliases.
 - Document APIs: `POST /api/v1/documents` (upload), `GET /api/v1/documents`, `GET /api/v1/documents/{id}`.
@@ -29,6 +30,11 @@ Nexora is an independently built enterprise knowledge intelligence foundation. T
 - Structured JSON logging (`structlog`) carries a request ID (HTTP, via middleware in `backend/app/main.py`) or job ID (ingestion worker) through contextvars, plus latency, retrieval counts, and provider/token metadata when available.
 - Upload validation sniffs content against real magic bytes for PDF/DOCX, not just extension/MIME, in `backend/app/services/documents.py`.
 - `backend/app/evaluation/` runs a deterministic, offline Recall@K/MRR check over a small fixture via `python -m app.evaluation.run` (from `backend/`).
+- `IngestionJob.stage` (`parsing`/`chunking`/`embedding`/`indexing`, nullable) records real per-job progress, set by `IngestionWorker` via `update_stage()`. UI feedback only, not authoritative - `status` still is. Exposed as `ingestion_stage` on `DocumentRead`.
+- `IngestionWorker.process_job(job_id)` claims and processes one specific job (via `DatabaseIngestionJobQueue.claim_job`), idempotent under SQS at-least-once redelivery; `process_next()` (poll mode) is unchanged and still what the local worker uses.
+- `DocumentService.upload` publishes the new job's ID through an injected `IngestionJobPublisher` (`backend/app/providers/queue/`) after commit - `NoopJobPublisher` by default, `SqsJobPublisher` when `INGESTION_QUEUE_URL` is set. Local polling mode is unaffected either way.
+- `GeminiEmbeddingProvider` (`backend/app/providers/embeddings/gemini.py`), selected via `EMBEDDING_PROVIDER=gemini`, is not exercised against a live API in this repository.
+- `backend/app/db/session.py` uses `NullPool` when it detects `AWS_LAMBDA_FUNCTION_NAME`, else the default pool - local dev is unaffected.
 
 ## Local commands
 

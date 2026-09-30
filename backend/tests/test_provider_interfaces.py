@@ -1,6 +1,8 @@
 import pytest
 
 from app.core.config import Settings
+from app.providers.embeddings.factory import create_embedding_provider
+from app.providers.embeddings.gemini import GeminiEmbeddingProvider
 from app.providers.embeddings.sentence_transformer import SentenceTransformerEmbeddingProvider
 from app.providers.llm.groq import GroqLLMProvider
 from app.providers.llm.interface import TextGenerationProvider
@@ -34,3 +36,22 @@ async def test_empty_embedding_batch_does_not_load_model() -> None:
 
     assert provider.dimensions == 384
     assert await provider.embed_texts([]) == []
+
+
+@pytest.mark.asyncio
+async def test_gemini_provider_requires_key_without_network_call() -> None:
+    provider = GeminiEmbeddingProvider(Settings(_env_file=None))
+
+    assert provider.dimensions == 384
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        await provider.embed_texts(["hello"])
+
+
+def test_embedding_factory_dispatches_on_provider_setting() -> None:
+    default = create_embedding_provider(Settings(_env_file=None))
+    assert isinstance(default, SentenceTransformerEmbeddingProvider)
+
+    gemini = create_embedding_provider(
+        Settings(_env_file=None, embedding_provider="gemini")
+    )
+    assert isinstance(gemini, GeminiEmbeddingProvider)

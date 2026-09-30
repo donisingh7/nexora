@@ -10,6 +10,7 @@ from app.core.security import sanitize_filename
 from app.models.document import Document
 from app.models.enums import IngestionStatus
 from app.models.ingestion_job import IngestionJob
+from app.providers.queue.interface import IngestionJobPublisher, NoopJobPublisher
 from app.providers.storage.interface import ObjectStorage
 from app.schemas.documents import DocumentRead
 from app.services.workspaces import DEFAULT_DEVELOPMENT_WORKSPACE_ID
@@ -50,10 +51,12 @@ class DocumentService:
         session: AsyncSession,
         storage: ObjectStorage,
         settings: Settings,
+        job_publisher: IngestionJobPublisher | None = None,
     ) -> None:
         self._session = session
         self._storage = storage
         self._settings = settings
+        self._job_publisher = job_publisher or NoopJobPublisher()
 
     def validate_upload(self, filename: str, content_type: str, content: bytes) -> str:
         safe_filename = sanitize_filename(filename)
@@ -122,6 +125,7 @@ class DocumentService:
             except Exception:
                 pass
             raise
+        await self._job_publisher.publish(job.id)
         return DocumentRead.from_model(document)
 
     async def list_documents(

@@ -2,6 +2,45 @@
 
 ## Completed sessions
 
+### ND-02 — Production-Demo UX + AWS Readiness
+
+Two-part pass on top of the working S1–S4 implementation: stronger first-time-user feedback in the existing UI, and AWS production-topology code readiness (Lambda, SQS, S3, Gemini, Supabase-safe pooling). No RAG architecture changes, no UI redesign, no AWS resources created, no real credentials used.
+
+**Delivered — UX**
+
+- **Landing page** now leads with the exact flow (`Upload → Index → Ask → Verify citations`) in both the hero graphic (now 4 steps, not 3) and a new "How Nexora works" guided section, plus a primary CTA ("Upload your first document") straight into the Documents page.
+- **Real ingestion progress, not a spinner:** `IngestionJob.stage` (`parsing`/`chunking`/`embedding`/`indexing`), written by the worker at each real step, shown on the document's status pill. No fake percentages anywhere.
+- **Toasts** (`ToastProvider` in `layout.tsx`) for upload success/error and query error, alongside the existing inline errors.
+- **Skeleton loading rows** for the initial document-list fetch, replacing a plain "Loading…" line.
+- **Chat UX:** duplicate-submit guard on the question form, a reveal animation on the answer/source panels, and a "New here? Upload a document first" link for first-time visitors with nothing indexed yet.
+- **Empty-state copy tightened** ("No documents yet — upload one above to get started") so a new visitor knows the next action without reading further.
+- Subtle hover/entrance motion on buttons, document rows, source cards, and foundation rows - all covered by the existing global `prefers-reduced-motion` rule in `globals.css` (no new guards needed).
+
+**Delivered — AWS readiness (code/config only)**
+
+- **API Lambda:** `app/main_lambda.py` (`Mangum(app)`), wrapping the identical FastAPI app used locally - no route changes.
+- **Worker Lambda:** `app/workers/lambda_handler.py`, an SQS event handler that calls a new `IngestionWorker.process_job(job_id)` - the same ingestion pipeline as the local poller (`process_next`), refactored to share one `_process_claimed_job` implementation.
+- **SQS idempotency:** `DatabaseIngestionJobQueue.claim_job(job_id)` only claims a still-`queued` job; a redelivered SQS message for an already-claimed/finished job is a logged no-op, not a duplicate run or a silent failure.
+- **Producer side:** `DocumentService.upload` publishes the new job's ID via an injected `IngestionJobPublisher` - `NoopJobPublisher` by default (unchanged local behavior), `SqsJobPublisher` when `INGESTION_QUEUE_URL` is set. A publish failure is logged loudly and never blocks the upload response.
+- **S3 and SQS credentials:** both use the AWS SDK default credential chain when no explicit keys are configured - a Lambda execution role in production, never a committed key.
+- **Gemini embedding provider:** `GeminiEmbeddingProvider` (`EMBEDDING_PROVIDER=gemini`), `output_dimensionality=384` to match the pinned vector column. Not exercised against a live API - flagged as such in code, docs, and here.
+- **Serverless-safe DB pooling:** `app/db/session.py` switches to `NullPool` when `AWS_LAMBDA_FUNCTION_NAME` is present; local/dev pooling is unchanged.
+- **Migration:** `0002_ingestion_stage` adds the nullable `ingestion_jobs.stage` column.
+- **Minimal Lambda packaging:** `backend/lambda/requirements.txt` + `backend/lambda/README.md` - no SAM/CDK/Terraform/Serverless-Framework template, by design.
+- **Docs:** README's "Manual integration & deployment" now names the concrete topology and exactly what a person must still provision; `docs/architecture.md` gained an "AWS production topology" section with its own diagram, kept separate from the primary local-implementation diagram.
+
+**Tests:** 5 new backend tests (SQS idempotent `process_job`, Gemini provider key-required check, embedding-factory dispatch, upload→publisher wiring), plus the existing ingestion-worker stage assertions extended.
+
+**Verification (last run)**
+
+- Backend: 65 passed, 1 skipped. Ruff: clean. Alembic `upgrade head --sql` (offline) generates valid DDL for the new `stage` column.
+- Frontend: lint clean, production build succeeded (4 routes), typecheck clean; smoke-tested via a local dev server (`/`, `/library`, `/chat` all return 200, new landing-page copy confirmed present in the rendered HTML).
+
+**Could not be validated in this environment**
+
+- The Lambda handlers, SQS publish/consume path, Gemini embedding calls, and Supabase `NullPool` behavior are none of them exercised against real AWS/Gemini/Supabase - by design, no credentials were available or used. Verified via unit tests against fakes/compiled SQL and local reasoning about the SDK/runtime contracts, not a live run.
+- No screenshots of the new UX states were captured (same limitation as S4 - no browser-capture capability in this environment).
+
 ### S4 — Portfolio Polish / Deployment Readiness
 
 Documentation, demo assets, and hygiene pass on top of the working S1–S3 implementation. No product features, architecture, or working UI behavior changed — only docs, a demo data package, portfolio-facing copy, and CI.
@@ -78,10 +117,10 @@ upload → validation → local storage → parse (PDF/DOCX/TXT/MD) → chunk �
 
 ## Not implemented
 
-Authentication/authorization, cloud deployment, real AWS/S3/IAM, live Groq configuration, monitoring/tracing infrastructure (log-based observability only exists), cost monitoring, OCR, additional file formats, knowledge briefs, rate limiting, malware scanning, live-database validation of retry/stale-recovery logic, repository screenshots.
+Authentication/authorization, actually provisioned AWS/Supabase resources (the Lambda/SQS/S3/Gemini/Supabase adapters exist in code and are unit-tested against fakes, but nothing has been created or deployed against real accounts), live Groq/Gemini configuration, monitoring/tracing infrastructure beyond structured logs, cost monitoring, OCR, additional file formats, knowledge briefs, rate limiting, malware scanning, live-database validation of retry/stale-recovery/SQS-idempotency logic, repository screenshots.
 
 ## Next state
 
 **Code Complete — Manual Integration & Deployment.**
 
-All planned local implementation work (S1–S4) is done and verified. What remains is not more code: it's a person supplying real credentials/infrastructure (cloud storage, a Groq key, a production database, a deployment target, auth) as described in the README's [Manual integration & deployment](README.md#manual-integration--deployment) section, then deploying.
+All planned local implementation work (S1–S4, ND-02) is done and verified, including AWS production-topology code readiness. What remains is not more code: it's a person supplying real credentials/infrastructure (cloud storage, an SQS queue, a Groq and/or Gemini key, a production database, a Lambda/API Gateway/Vercel deployment, auth) as described in the README's [Manual integration & deployment](README.md#manual-integration--deployment) section, then deploying.

@@ -10,6 +10,8 @@ from app.providers.embeddings.factory import create_embedding_provider
 from app.providers.embeddings.interface import EmbeddingProvider
 from app.providers.llm.groq import GroqLLMProvider
 from app.providers.llm.interface import TextGenerationProvider
+from app.providers.queue.factory import create_job_publisher
+from app.providers.queue.interface import IngestionJobPublisher
 from app.providers.storage.factory import create_object_storage
 from app.providers.storage.interface import ObjectStorage
 from app.retrieval.dense import PgVectorDenseRetriever
@@ -38,12 +40,18 @@ def get_llm_provider() -> TextGenerationProvider:
     return GroqLLMProvider()
 
 
+@lru_cache
+def get_job_publisher() -> IngestionJobPublisher:
+    return create_job_publisher()
+
+
 async def get_document_service(
     session: Annotated[AsyncSession, Depends(get_session)],
     storage: Annotated[ObjectStorage, Depends(get_storage_provider)],
     settings: Annotated[Settings, Depends(get_settings)],
+    job_publisher: Annotated[IngestionJobPublisher, Depends(get_job_publisher)],
 ) -> DocumentService:
-    return DocumentService(session, storage, settings)
+    return DocumentService(session, storage, settings, job_publisher)
 
 
 async def get_development_workspace(

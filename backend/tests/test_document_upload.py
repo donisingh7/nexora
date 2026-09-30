@@ -40,6 +40,14 @@ class FakeSession:
         document.updated_at = document.created_at
 
 
+class FakeJobPublisher:
+    def __init__(self) -> None:
+        self.published: list = []
+
+    async def publish(self, job_id) -> None:
+        self.published.append(job_id)
+
+
 @pytest.fixture
 def upload_service(tmp_path):
     session = FakeSession()
@@ -68,6 +76,22 @@ async def test_upload_creates_document_job_and_local_object(upload_service) -> N
     assert job.status == IngestionStatus.QUEUED.value
     assert await storage.read(document.storage_key) == b"knowledge text"
     session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_upload_publishes_job_id_when_a_publisher_is_configured(tmp_path) -> None:
+    session = FakeSession()
+    storage = LocalStorageProvider(tmp_path)
+    publisher = FakeJobPublisher()
+    service = DocumentService(session, storage, Settings(_env_file=None), publisher)
+
+    result = await service.upload(
+        filename="notes.txt", content_type="text/plain", content=b"text", workspace_id=uuid.uuid4()
+    )
+
+    _, job = session.records
+    assert publisher.published == [job.id]
+    assert result.status == IngestionStatus.QUEUED
 
 
 @pytest.mark.parametrize(

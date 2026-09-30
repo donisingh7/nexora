@@ -48,3 +48,23 @@
 - **Upload validation adds content sniffing, not a new validation layer.** PDF/DOCX uploads must start with their real magic bytes in addition to the existing extension+MIME check; TXT/Markdown have no reliable magic number and are left as before.
 - **Retrieved document text is explicitly framed as untrusted data in both the system prompt and the context block.** This is a mitigation, not a guarantee — the real safety property is structural: citations are built by application code from the retrieved candidate list, never parsed from model output, so injected text in a document cannot fabricate a citation or misattribute one regardless of what the model does with it.
 - **Evaluation uses a dependency-free bag-of-words stand-in for the dense retriever**, not the real embedding provider, so `python -m app.evaluation.run` needs no model download, network access, or credentials and stays runnable in the same environment as the test suite. It is explicitly documented as a proxy for exercising hybrid fusion, not a measure of production embedding quality.
+
+## ND-02 constraints (production-demo UX + AWS readiness)
+
+- Improve UX feedback/loading/onboarding within the existing design language; do not replace it with a generic dashboard or redesign the RAG architecture.
+- No fake progress percentages; only real, worker-reported stages.
+- Implement AWS code/config readiness (Lambda, SQS, S3, Gemini, Supabase-safe DB pooling) without creating AWS resources or using real credentials.
+- Preserve local development exactly as-is: every new adapter is additive and opt-in via configuration, never a replacement the local path depends on.
+- SQS delivers at-least-once; ingestion must stay idempotent under redelivery. No silently swallowed ingestion failures.
+- No Docker/Kubernetes/Terraform work, no auth/SSO, no new product features.
+
+## ND-02 decisions
+
+- **Ingestion progress is a `stage` column on the job row, not a percentage.** The worker writes `parsing`/`chunking`/`embedding`/`indexing` via `update_stage()`, a small commit guarded to `status = 'processing'` at each of the four real steps. It is advisory UI state only; `status` (`queued`/`processing`/`completed`/`failed`) remains the sole correctness signal, unchanged from S2.
+- **The SQS worker path reuses the same `IngestionWorker`, not a parallel implementation.** `process_next` (poll: claim whatever's queued) and `process_job(job_id)` (push: claim one named job) both delegate to a shared `_process_claimed_job`, so parsing/chunking/embedding/retry/stage logic exists exactly once regardless of which Lambda or process calls it.
+- **SQS idempotency is enforced by the claim, not by deduplication logic.** `claim_job(job_id)` only succeeds if the job is still `queued`; a redelivered message for an already-claimed or finished job finds nothing to claim and is logged as a no-op. No message-ID tracking table was added - the job's own status is the dedupe key.
+- **Publishing to SQS is best-effort and never blocks or fails the upload.** The database row is the durable source of truth (unchanged from S1/S2); a publish failure is logged loudly (`logger.exception`), not swallowed, but the HTTP response still succeeds, since local/poll-based workers do not depend on the publish at all and a push-only deployment already has the durable row to fall back on once whatever's wrong with SQS is fixed.
+- **A `NoopJobPublisher` is the default, matching the existing provider-protocol pattern** (`ObjectStorage`, `EmbeddingProvider`, `TextGenerationProvider`) rather than an `if settings.ingestion_queue_url` branch inside `DocumentService`. `create_job_publisher()` picks `SqsJobPublisher` only when `INGESTION_QUEUE_URL` is set.
+- **Gemini embeddings are implemented against the published SDK shape but not verified against a live API** in this repository (no key available, none requested). Documented as such in code and docs, consistent with how the Groq provider was already treated - a real key is required before relying on it in production.
+- **No AWS credentials, SAM/CDK/Terraform templates, or actual resource provisioning were created.** `backend/lambda/` contains only a requirements file and a manual packaging README; wiring API Gateway, the SQS event source mapping, and IAM policies is an explicitly deferred manual step.
+- **Toasts, skeleton loaders, and reveal animations reuse existing CSS custom properties, keyframes, and component classes** (the forest/mint/coral palette, the existing `reveal`/`spin` keyframes, `.primary-button`) rather than introducing a UI library or a new visual language. The global `prefers-reduced-motion` rule already in `globals.css` covers all new animations without additional guards.

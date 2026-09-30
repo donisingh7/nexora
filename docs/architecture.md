@@ -1,8 +1,8 @@
 # Architecture
 
-## Current state (S1–S3 complete)
+## Current state (S1–S4 complete)
 
-The end-to-end knowledge path is implemented locally: upload → validation → local object storage → parse → chunk → embed → pgvector + BM25 retrieval → RRF fusion → optional reranking → context assembly → grounded answer with citations. PostgreSQL is the authoritative store for documents, chunks, and ingestion jobs. Structured request/job telemetry, ingestion retry and stale-lock recovery, upload content sniffing, and a deterministic offline retrieval evaluation are also implemented (S3) and covered below. Authentication is not implemented and no cloud infrastructure is configured — see the root [README's manual integration section](../README.md#manual-integration--deployment).
+The end-to-end knowledge path is implemented locally: upload → validation → local object storage → parse → chunk → embed → pgvector + BM25 retrieval → RRF fusion → optional reranking → context assembly → grounded answer with citations. PostgreSQL is the authoritative store for documents, chunks, and ingestion jobs. Structured request/job telemetry, ingestion retry and stale-lock recovery, upload content sniffing, and a deterministic offline retrieval evaluation are also implemented (S3) and covered below. A production AWS topology (Lambda, SQS, S3, Gemini embeddings) exists in code but is not deployed (S4/ND-02) — see [AWS production topology](#aws-production-topology-code-ready-not-deployed). Authentication is not implemented and no cloud infrastructure is provisioned — see the root [README's manual integration section](../README.md#manual-integration--deployment).
 
 ```mermaid
 flowchart TB
@@ -67,9 +67,11 @@ flowchart TB
 
 ## Ingestion
 
-`DocumentService.upload` sanitizes the filename, validates extension against MIME type and the configured allowlist, enforces the size limit, writes the object under `{workspace}/{document}/{filename}`, and inserts the `Document` and queued `IngestionJob` in one transaction. If the database write fails, the stored object is deleted so storage does not leak orphans.
+`DocumentService.upload` sanitizes the filename, validates extension against MIME type and the configured allowlist, enforces the size limit, writes the object under `{workspace}/{document}/{filename}`, and inserts the `Document` and queued `IngestionJob` in one transaction. If the database write fails, the stored object is deleted so storage does not leak orphans. If `INGESTION_QUEUE_URL` is configured, it then publishes the job ID to SQS (see [AWS production topology](#aws-production-topology-code-ready-not-deployed)); that publish is best-effort and logged loudly on failure, never silent, since the DB row is already the durable source of truth.
 
-`IngestionWorker.process_next` claims one queued job with `FOR UPDATE SKIP LOCKED`, loads the object, parses, chunks, embeds, replaces any existing chunks for that document, and finalizes. Chunk rows and the terminal job/document status commit together, so a partially indexed document cannot appear `completed`. Failures roll back, record `ExceptionType: message` on the job, and set the document to `failed`. The worker is a plain Python process (`app.workers.run_ingestion`); no Redis, Celery, or Kafka is introduced.
+`IngestionWorker.process_next` claims one queued job with `FOR UPDATE SKIP LOCKED`, loads the object, parses, chunks, embeds, replaces any existing chunks for that document, and finalizes. Chunk rows and the terminal job/document status commit together, so a partially indexed document cannot appear `completed`. Failures roll back, record `ExceptionType: message` on the job, and set the document to `failed` (or back to `queued` for a retry - see [Reliability](#reliability)). The worker is a plain Python process (`app.workers.run_ingestion`); no Redis, Celery, or Kafka is introduced. `IngestionWorker.process_job(job_id)` is the same pipeline entered a different way - claiming one *specific* job instead of polling for the next one - used by the SQS-triggered worker Lambda.
+
+At four points during processing the worker records a lightweight `stage` on the job (`parsing`, `chunking`, `embedding`, `indexing`) via `DatabaseIngestionJobQueue.update_stage`, each its own small commit guarded to `status = 'processing'`. This is UI feedback only - `status` remains the sole source of truth for whether a document is actually done - and the frontend shows it on the document's status pill while a job is in progress.
 
 ## Retrieval trade-offs
 
@@ -118,6 +120,37 @@ Two gaps in the S2 job queue are closed without changing its shape (still a sing
 
 Both are plain SQL `UPDATE ... WHERE` statements guarded by status, so they compose safely with `SKIP LOCKED` claiming and the existing conditional-completion invariant — a partially indexed document still cannot show `completed`.
 
+A third case matters only for the push-based (SQS) path: at-least-once delivery means a job's ID can arrive twice. `DatabaseIngestionJobQueue.claim_job(job_id)` only claims a job whose status is still `queued`; a redelivered message for a job that's already `processing`, `completed`, or `failed` finds nothing to claim and `IngestionWorker.process_job` returns `False` - a logged, intentional no-op, not a silently dropped failure and not a duplicate run.
+
 ## Evaluation
 
 `app/evaluation/` provides a small, deterministic, fully offline retrieval evaluation — no database, network access, or credentials, runnable anywhere the test suite runs (`python -m app.evaluation.run` from `backend/`). It exercises the real `HybridRrfRetriever` (dense + BM25 + RRF) against a synthetic five-document policy fixture and five queries with known-relevant answers, reporting **Recall@K** (fraction of relevant chunks found in the top K) and **MRR** (mean reciprocal rank of the first relevant hit). Because a real embedding model is an optional dependency and must stay offline-safe, dense retrieval is stood in for by a dependency-free bag-of-words cosine-similarity scorer (`BagOfWordsDenseRetriever`) — it is not the production embedding provider, only a deterministic proxy for exercising fusion. `tests/test_evaluation.py` pins the fixture's expected Recall@3 (1.0) and MRR (≥0.8) as a regression guard: a drop signals a real change in fusion or ranking behavior, not fixture noise. This evaluation validates retrieval mechanics, not production embedding quality — a live run against `sentence-transformers` and real documents remains future work.
+
+## AWS production topology (code-ready, not deployed)
+
+The target production shape this codebase is written for - not provisioned, not deployed, no real AWS/Supabase/Gemini credentials used anywhere in this repository:
+
+```mermaid
+flowchart LR
+  FE[Next.js frontend<br/>Vercel] --> GW[API Gateway]
+  GW --> APILAMBDA["API Lambda<br/>app.main_lambda:handler<br/>(FastAPI via Mangum)"]
+  APILAMBDA --> DB[(Supabase PostgreSQL<br/>+ pgvector)]
+  APILAMBDA --> S3[(Private S3 bucket)]
+  APILAMBDA -- "publish job_id<br/>(INGESTION_QUEUE_URL set)" --> SQS[[SQS queue]]
+  SQS --> WLAMBDA["Worker Lambda<br/>app.workers.lambda_handler:handler"]
+  WLAMBDA --> DB
+  WLAMBDA --> S3
+  WLAMBDA --> GEMINI[Gemini embeddings]
+  APILAMBDA --> GROQ[Groq generation]
+```
+
+Same application code runs both locally and here - only the outer adapters differ:
+
+- **API Lambda** (`app/main_lambda.py`): `Mangum(app)` wraps the identical FastAPI app used by `uvicorn`/`docker compose` locally. No route or service code is Lambda-specific.
+- **Worker Lambda** (`app/workers/lambda_handler.py`): an SQS event handler that extracts a job ID from each message body and calls `IngestionWorker.process_job(job_id)` - the same `IngestionWorker` class the local polling worker uses, just entered by a specific ID instead of "claim whatever's next."
+- **Storage and queue credentials**: `S3StorageProvider` and `SqsJobPublisher` (`app/providers/queue/sqs.py`) construct their `boto3` clients with no explicit key/secret when none are configured, so they resolve through the AWS SDK's default credential chain - in Lambda, that's the function's IAM execution role. `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` remain available only for non-Lambda testing.
+- **Embeddings**: `GeminiEmbeddingProvider` (`app/providers/embeddings/gemini.py`), selected by `EMBEDDING_PROVIDER=gemini`, calls `output_dimensionality=384` to match the pinned vector column, avoiding a sentence-transformers/torch dependency in the Lambda package. It has not been exercised against a live Gemini API in this repository - see `DECISIONS.md`.
+- **Database pooling**: `app/db/session.py` switches to SQLAlchemy's `NullPool` when it detects a Lambda runtime (`AWS_LAMBDA_FUNCTION_NAME` is set), since a long-lived connection pool doesn't fit a frozen/thawed execution model or how Supabase expects serverless clients to connect. Local/long-running processes keep the default pool.
+- **Packaging**: `backend/lambda/requirements.txt` and `backend/lambda/README.md` describe a minimal, manual packaging process. No SAM/CDK/Terraform/Serverless-Framework template, API Gateway route config, or IAM policy document is included - wiring those up is the deliberately deferred manual step described in the root README.
+
+Reliability property carried over unchanged: SQS's at-least-once delivery means a job ID can be delivered twice, and `claim_job` (see [Reliability](#reliability)) makes a redelivery a safe no-op rather than a duplicate ingestion run.
