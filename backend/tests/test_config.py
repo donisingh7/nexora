@@ -11,6 +11,7 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.max_upload_size_bytes > 0
     assert "application/pdf" in settings.allowed_upload_mime_types
     assert settings.groq_api_key is None
+    assert settings.groq_model == "openai/gpt-oss-20b"
     assert settings.aws_secret_access_key is None
 
 

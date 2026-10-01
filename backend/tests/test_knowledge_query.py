@@ -73,6 +73,16 @@ async def test_answer_removes_unknown_model_citation_labels() -> None:
     assert [citation.citation_id for citation in response.citations] == ["S1"]
 
 
+@pytest.mark.asyncio
+async def test_answer_bounds_and_normalizes_fullwidth_citation_labels() -> None:
+    llm = FakeLLMProvider("Known 【S1】, invented 【S9】.")
+    service = KnowledgeQueryService(FakeHybrid([sample_candidate()]), llm)
+
+    response = await service.answer("query", workspace_id=uuid4(), top_k=3)
+
+    assert response.answer == "Known [S1], invented ."
+
+
 def malicious_candidate() -> RetrievalCandidate:
     return RetrievalCandidate(
         chunk_id=uuid4(),
