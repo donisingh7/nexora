@@ -15,7 +15,7 @@ import structlog
 from app.api.dependencies import get_embedding_provider, get_storage_provider
 from app.core.config import get_settings
 from app.db.session import SessionFactory
-from app.services.ingestion import IngestionWorker
+from app.services.ingestion import IngestionRetryRequested, IngestionWorker
 
 logger = structlog.get_logger(__name__)
 
@@ -31,6 +31,7 @@ async def _handle(event: dict) -> dict:
 
     processed = 0
     skipped = 0
+    retry: IngestionRetryRequested | None = None
     async with SessionFactory() as session:
         worker = IngestionWorker(session, storage, embeddings, settings)
         for record in event.get("Records", []):
@@ -38,12 +39,21 @@ async def _handle(event: dict) -> dict:
             if job_id is None:
                 logger.warning("sqs_record_missing_job_id", record_keys=list(record.keys()))
                 continue
-            did_process = await worker.process_job(job_id)
+            try:
+                did_process = await worker.process_job(job_id)
+            except IngestionRetryRequested as exc:
+                retry = exc
+                continue
             if did_process:
                 processed += 1
             else:
                 skipped += 1
 
+    if retry is not None:
+        # Fail the invocation so SQS redelivers after the visibility timeout; the job is
+        # already back in `queued`. Records in the same batch that succeeded are skipped
+        # idempotently on redelivery (no longer `queued`).
+        raise retry
     return {"processed": processed, "skipped": skipped}
 
 
