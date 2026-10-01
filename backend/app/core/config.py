@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,11 +27,25 @@ class Settings(BaseSettings):
 
     embedding_provider: Literal["sentence_transformers", "gemini"] = "sentence_transformers"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_dimensions: Literal[384] = 384
+    # Plain `int` (not `Literal[384]`): pydantic's Literal validation does not coerce a
+    # string env value ("384") to int before comparing, so a real `.env` setting this
+    # would fail Settings() construction entirely. The validator below enforces the same
+    # "must be 384" guarantee at runtime instead.
+    embedding_dimensions: int = 384
     gemini_api_key: SecretStr | None = None
     gemini_embedding_model: str = "gemini-embedding-2"
 
     ingestion_queue_url: str | None = None
+
+    @field_validator("embedding_dimensions")
+    @classmethod
+    def _embedding_dimensions_must_match_schema(cls, value: int) -> int:
+        if value != 384:
+            raise ValueError(
+                "embedding_dimensions must be 384 (the pinned vector column width); "
+                "changing it requires a migration and re-embedding all chunks"
+            )
+        return value
 
     max_upload_size_bytes: int = Field(default=25_000_000, gt=0)
     allowed_upload_mime_types: list[str] = Field(
