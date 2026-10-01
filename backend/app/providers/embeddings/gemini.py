@@ -38,9 +38,14 @@ class GeminiEmbeddingProvider:
         client = self._get_client()
 
         def _call() -> list[list[float]]:
+            # Each text must be its own single-element list, not one flat list of
+            # strings: the SDK's `gemini-embedding-2` content-grouping groups
+            # consecutive bare string "parts" into one multi-part Content, which
+            # collapses a flat `contents=texts` batch into a single embedding instead
+            # of one per text. Wrapping each text keeps them as separate Contents.
             response = client.models.embed_content(
                 model=self._settings.gemini_embedding_model,
-                contents=texts,
+                contents=[[text] for text in texts],
                 config={"output_dimensionality": self._settings.embedding_dimensions},
             )
             return [list(embedding.values) for embedding in response.embeddings]
