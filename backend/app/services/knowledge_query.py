@@ -9,7 +9,9 @@ from app.retrieval.hybrid import HybridRrfRetriever
 from app.retrieval.interfaces import RetrievalCandidate
 from app.schemas.query import AnswerResponse, CitationRead, RetrievedChunkRead
 
-_CITATION_REFERENCE = re.compile(r"\[S(\d+)\]")
+# Some models (e.g. openai/gpt-oss-20b) emit fullwidth 【S1】 labels instead of [S1];
+# match both so invented labels are always stripped, and normalize kept ones to [S1].
+_CITATION_REFERENCE = re.compile(r"[\[\u3010]S(\d+)[\]\u3011]")
 
 logger = structlog.get_logger(__name__)
 
@@ -163,7 +165,9 @@ class KnowledgeQueryService:
     @staticmethod
     def _remove_unknown_source_labels(answer: str, source_count: int) -> str:
         return _CITATION_REFERENCE.sub(
-            lambda match: match.group(0) if int(match.group(1)) <= source_count else "",
+            lambda match: (
+                f"[S{match.group(1)}]" if 1 <= int(match.group(1)) <= source_count else ""
+            ),
             answer,
         )
 

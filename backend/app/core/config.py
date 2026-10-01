@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     aws_secret_access_key: SecretStr | None = None
 
     groq_api_key: SecretStr | None = None
-    groq_model: str = "llama-3.1-8b-instant"
+    groq_model: str = "openai/gpt-oss-20b"
 
     embedding_provider: Literal["sentence_transformers", "gemini"] = "sentence_transformers"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
