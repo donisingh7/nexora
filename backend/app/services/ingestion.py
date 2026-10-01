@@ -18,6 +18,16 @@ from app.services.ingestion_jobs import DatabaseIngestionJobQueue, IngestionJobQ
 logger = structlog.get_logger(__name__)
 
 
+class IngestionRetryRequested(RuntimeError):
+    """Raised by push mode (`process_job`) after a failed job was requeued in the DB with
+    attempts remaining. The caller must fail its invocation so the queue message is
+    redelivered - a push-only deployment has no poller to find the requeued job."""
+
+    def __init__(self, job_id: UUID) -> None:
+        super().__init__(f"Ingestion job {job_id} failed and was requeued for retry")
+        self.job_id = job_id
+
+
 class IngestionWorker:
     def __init__(
         self,
@@ -51,7 +61,9 @@ class IngestionWorker:
     async def process_job(self, job_id: UUID) -> bool:
         """Push mode: process one specific job named by an SQS message. Returns False
         (not an error) for a redelivered message whose job is no longer `queued` -
-        already claimed, completed, or failed - so at-least-once delivery stays safe."""
+        already claimed, completed, or failed - so at-least-once delivery stays safe.
+        Raises `IngestionRetryRequested` after requeueing a failed job that has attempts
+        left, so the message is redelivered instead of deleted."""
         recovered = await self._queue.recover_stale(self._settings.ingestion_stale_after_seconds)
         if recovered:
             logger.warning("ingestion_jobs_recovered_from_stale_lock", count=recovered)
@@ -60,10 +72,12 @@ class IngestionWorker:
         if job is None:
             logger.info("ingestion_job_skipped_not_queued", job_id=str(job_id))
             return False
-        await self._process_claimed_job(job)
+        if await self._process_claimed_job(job):
+            raise IngestionRetryRequested(job.id)
         return True
 
-    async def _process_claimed_job(self, job: IngestionJob) -> None:
+    async def _process_claimed_job(self, job: IngestionJob) -> bool:
+        """Returns True when the job failed and was requeued for another attempt."""
         structlog.contextvars.bind_contextvars(
             job_id=str(job.id), document_id=str(job.document_id)
         )
@@ -116,6 +130,7 @@ class IngestionWorker:
                 attempts=job.attempts,
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
             )
+            return False
         except Exception as exc:
             await self._session.rollback()
             reason = self._useful_error(exc)
@@ -128,6 +143,7 @@ class IngestionWorker:
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
             )
             await self._queue.mark_failed(job.id, reason, requeue=should_retry)
+            return should_retry
         finally:
             structlog.contextvars.unbind_contextvars("job_id", "document_id")
 

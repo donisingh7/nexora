@@ -5,7 +5,7 @@ import pytest
 
 from app.core.config import Settings
 from app.ingestion.parsers import ParsedUnit
-from app.services.ingestion import IngestionWorker
+from app.services.ingestion import IngestionRetryRequested, IngestionWorker
 
 
 class FakeEmbeddingProvider:
@@ -206,3 +206,138 @@ async def test_process_job_is_idempotent_for_a_redelivered_sqs_message() -> None
     assert queue.completed is False
     assert queue.failed is None
     assert queue.stages == []
+
+
+class BrokenStorage:
+    async def read(self, key: str) -> bytes:
+        raise FileNotFoundError("object missing")
+
+
+def make_broken_worker(queue, session, *, max_attempts: int = 3) -> IngestionWorker:
+    return IngestionWorker(
+        session,
+        BrokenStorage(),
+        FakeEmbeddingProvider(),
+        Settings(_env_file=None, max_ingestion_attempts=max_attempts),
+        queue=queue,
+        parsers=FakeParserRegistry(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_job_requeues_then_raises_retry_when_attempts_remain() -> None:
+    """Push mode has no poller: a requeued job must surface as an error so the SQS
+    message is redelivered rather than deleted - and only after the DB requeue."""
+    job = make_job(attempts=1)
+    session = FakeSession()
+    queue = FakeQueue(job, job_by_id={job.id: job})
+    worker = make_broken_worker(queue, session)
+
+    with pytest.raises(IngestionRetryRequested) as excinfo:
+        await worker.process_job(job.id)
+
+    assert excinfo.value.job_id == job.id
+    assert queue.requeued is True
+    assert queue.failed == "FileNotFoundError: object missing"
+    assert queue.completed is False
+    assert session.rollbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_process_job_marks_failed_without_retry_when_attempts_exhausted() -> None:
+    job = make_job(attempts=3)
+    session = FakeSession()
+    queue = FakeQueue(job, job_by_id={job.id: job})
+    worker = make_broken_worker(queue, session, max_attempts=3)
+
+    assert await worker.process_job(job.id) is True
+    assert queue.requeued is False
+    assert queue.failed == "FileNotFoundError: object missing"
+
+
+@pytest.mark.asyncio
+async def test_process_next_swallows_retryable_failure_for_local_poller() -> None:
+    """Poll mode finds the requeued job itself, so a retryable failure must not raise
+    out of `process_next` and kill `run_forever`."""
+    job = make_job(attempts=1)
+    queue = FakeQueue(job)
+    worker = make_broken_worker(queue, FakeSession())
+
+    assert await worker.process_next() is True
+    assert queue.requeued is True
+
+
+class _FakeSessionFactory:
+    async def __aenter__(self):
+        return FakeSession()
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+
+def _patch_lambda_worker(monkeypatch, job_by_id, storage) -> FakeQueue:
+    from app.workers import lambda_handler
+
+    queue = FakeQueue(None, job_by_id=job_by_id)
+
+    def build_worker(session, _storage, embeddings, settings):
+        return IngestionWorker(
+            session,
+            storage,
+            embeddings,
+            Settings(_env_file=None, max_ingestion_attempts=3),
+            queue=queue,
+            parsers=FakeParserRegistry(),
+        )
+
+    monkeypatch.setattr(lambda_handler, "SessionFactory", _FakeSessionFactory)
+    monkeypatch.setattr(lambda_handler, "get_storage_provider", lambda: storage)
+    monkeypatch.setattr(lambda_handler, "get_embedding_provider", FakeEmbeddingProvider)
+    monkeypatch.setattr(lambda_handler, "IngestionWorker", build_worker)
+    return queue
+
+
+def _sqs_event(*job_ids) -> dict:
+    return {"Records": [{"body": str(job_id)} for job_id in job_ids]}
+
+
+def test_lambda_handler_fails_invocation_on_retryable_failure(monkeypatch) -> None:
+    from app.workers.lambda_handler import handler
+
+    job = make_job(attempts=1)
+    queue = _patch_lambda_worker(monkeypatch, {job.id: job}, BrokenStorage())
+
+    with pytest.raises(IngestionRetryRequested):
+        handler(_sqs_event(job.id), None)
+    assert queue.requeued is True
+
+
+def test_lambda_handler_succeeds_on_final_failure(monkeypatch) -> None:
+    from app.workers.lambda_handler import handler
+
+    job = make_job(attempts=3)
+    queue = _patch_lambda_worker(monkeypatch, {job.id: job}, BrokenStorage())
+
+    assert handler(_sqs_event(job.id), None) == {"processed": 1, "skipped": 0}
+    assert queue.requeued is False
+
+
+def test_lambda_handler_skips_redelivered_non_queued_job(monkeypatch) -> None:
+    from app.workers.lambda_handler import handler
+
+    job = make_job()
+    queue = _patch_lambda_worker(monkeypatch, {}, FakeStorage(b"source"))
+
+    assert handler(_sqs_event(job.id), None) == {"processed": 0, "skipped": 1}
+    assert queue.failed is None
+    assert queue.completed is False
+
+
+def test_lambda_handler_succeeds_on_successful_ingestion(monkeypatch) -> None:
+    from app.workers.lambda_handler import handler
+
+    job = make_job()
+    queue = _patch_lambda_worker(monkeypatch, {job.id: job}, FakeStorage(b"source"))
+
+    assert handler(_sqs_event(job.id), None) == {"processed": 1, "skipped": 0}
+    assert queue.completed is True
