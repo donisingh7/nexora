@@ -1,0 +1,180 @@
+name: Deploy Lambda
+
+# Manual production deploy of the shared backend ZIP to both existing Lambda functions.
+# Only function code is updated - environment variables, IAM, SQS, event-source
+# mappings and API Gateway are managed outside this workflow and never touched here.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-lambda-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  PYTHON_VERSION: "3.12"
+  DEPLOY_BUCKET: nexora-prod-documents
+  API_FUNCTION: nexora-api
+  WORKER_FUNCTION: nexora-ingestion-worker
+  API_HANDLER: app.main_lambda.handler
+  WORKER_HANDLER: app.workers.lambda_handler.handler
+  ZIP_NAME: nexora-lambda-${{ github.sha }}.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Lambda dependencies (manylinux x86_64, CPython 3.12)
+        run: |
+          set -euo pipefail
+          mkdir -p build/package
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --requirement backend/lambda/requirements.txt \
+            --target build/package \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version "${PYTHON_VERSION}" \
+            --only-binary=:all: \
+            --no-compile
+
+      - name: Add application code
+        run: |
+          set -euo pipefail
+          cp -r backend/app build/package/app
+          find build/package \
+            \( -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache -o -name .ruff_cache \) \
+            -prune -exec rm -rf {} +
+          find build/package -name '*.py[co]' -delete
+          find build/package \( -name '.env' -o -name '.env.*' \) -delete
+
+      - name: Verify package contents
+        working-directory: build/package
+        run: |
+          set -euo pipefail
+          for forbidden in torch sentence_transformers transformers tests .git .data; do
+            if [ -e "$forbidden" ]; then
+              echo "::error::forbidden entry '$forbidden' found in package root"
+              exit 1
+            fi
+          done
+          if find . -path ./app -prune -o -name '*.so' -exec file {} + | grep -v 'ELF 64-bit LSB.*x86-64' | grep -q .; then
+            echo "::error::non x86_64 ELF native library found in package"
+            exit 1
+          fi
+          test -f app/main_lambda.py
+          test -f app/workers/lambda_handler.py
+
+      - name: Import both handlers from the package
+        working-directory: build/package
+        # Settings defaults are enough to import; no secrets or network are needed.
+        run: |
+          python -I -c "
+          import sys; sys.path.insert(0, '.')
+          import app.main_lambda, app.workers.lambda_handler
+          assert callable(app.main_lambda.handler)
+          assert callable(app.workers.lambda_handler.handler)
+          print('handlers import OK')
+          "
+
+      - name: Build ZIP
+        run: |
+          set -euo pipefail
+          unzipped=$(du -sb build/package | cut -f1)
+          echo "Uncompressed package bytes: ${unzipped}"
+          if [ "${unzipped}" -ge 262144000 ]; then
+            echo "::error::package exceeds Lambda's 250 MB unzipped limit"
+            exit 1
+          fi
+          (cd build/package && zip -q -r -X "../${ZIP_NAME}" .)
+          echo "Compressed ZIP bytes: $(stat -c %s "build/${ZIP_NAME}")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-zip
+          path: build/${{ env.ZIP_NAME }}
+          retention-days: 7
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lambda-zip
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Every `aws lambda` call below uses --query with an explicit field list (or
+      # discards output), because full function configuration includes Environment.
+      - name: Preflight - confirm target functions match the package
+        run: |
+          set -euo pipefail
+          check() {
+            local fn="$1" handler="$2"
+            read -r runtime arch actual_handler < <(aws lambda get-function-configuration \
+              --function-name "$fn" \
+              --query '[Runtime, Architectures[0], Handler]' --output text)
+            echo "$fn: runtime=$runtime arch=$arch handler=$actual_handler"
+            [ "$runtime" = "python${PYTHON_VERSION}" ] || { echo "::error::$fn runtime is $runtime"; exit 1; }
+            [ "$arch" = "x86_64" ] || { echo "::error::$fn architecture is $arch"; exit 1; }
+            [ "$actual_handler" = "$handler" ] || { echo "::error::$fn handler is $actual_handler"; exit 1; }
+          }
+          check "$API_FUNCTION" "$API_HANDLER"
+          check "$WORKER_FUNCTION" "$WORKER_HANDLER"
+
+      - name: Upload ZIP to S3
+        run: |
+          set -euo pipefail
+          aws s3 cp "${ZIP_NAME}" "s3://${DEPLOY_BUCKET}/__deploy__/${ZIP_NAME}" --only-show-errors
+          echo "Uploaded s3://${DEPLOY_BUCKET}/__deploy__/${ZIP_NAME}"
+
+      - name: Update function code
+        run: |
+          set -euo pipefail
+          for fn in "$API_FUNCTION" "$WORKER_FUNCTION"; do
+            aws lambda update-function-code \
+              --function-name "$fn" \
+              --s3-bucket "$DEPLOY_BUCKET" \
+              --s3-key "__deploy__/${ZIP_NAME}" \
+              --query '{FunctionName: FunctionName, LastUpdateStatus: LastUpdateStatus}' \
+              --output table
+            aws lambda wait function-updated-v2 --function-name "$fn"
+          done
+
+      - name: Verify deployment
+        run: |
+          set -euo pipefail
+          expected_sha=$(openssl dgst -sha256 -binary "${ZIP_NAME}" | base64)
+          verify() {
+            local fn="$1" handler="$2"
+            aws lambda get-function-configuration --function-name "$fn" \
+              --query '{FunctionName: FunctionName, Runtime: Runtime, Handler: Handler, Architectures: Architectures[0], State: State, LastUpdateStatus: LastUpdateStatus, CodeSize: CodeSize, CodeSha256: CodeSha256}' \
+              --output table
+            read -r state status actual_handler sha < <(aws lambda get-function-configuration \
+              --function-name "$fn" \
+              --query '[State, LastUpdateStatus, Handler, CodeSha256]' --output text)
+            [ "$state" = "Active" ] || { echo "::error::$fn state is $state"; exit 1; }
+            [ "$status" = "Successful" ] || { echo "::error::$fn last update status is $status"; exit 1; }
+            [ "$actual_handler" = "$handler" ] || { echo "::error::$fn handler is $actual_handler"; exit 1; }
+            [ "$sha" = "$expected_sha" ] || { echo "::error::$fn CodeSha256 does not match the built ZIP"; exit 1; }
+          }
+          verify "$API_FUNCTION" "$API_HANDLER"
+          verify "$WORKER_FUNCTION" "$WORKER_HANDLER"
