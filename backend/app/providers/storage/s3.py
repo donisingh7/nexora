@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Any
 
 from app.core.config import Settings
@@ -11,14 +12,24 @@ class S3StorageProvider:
             raise ValueError("S3_BUCKET must be configured when S3 storage is selected")
         self._bucket = settings.s3_bucket
         self._region = settings.aws_region
-        self._access_key_id = (
-            settings.aws_access_key_id.get_secret_value() if settings.aws_access_key_id else None
-        )
-        self._secret_access_key = (
-            settings.aws_secret_access_key.get_secret_value()
-            if settings.aws_secret_access_key
-            else None
-        )
+        self._access_key_id: str | None = None
+        self._secret_access_key: str | None = None
+        # In Lambda the runtime exports the execution role's temporary STS credentials as
+        # AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN, which Settings also
+        # reads. Passing only the key pair drops the session token (InvalidAccessKeyId), so
+        # Lambda always uses boto3's default credential chain. Explicit keys are honoured
+        # only outside Lambda, for local testing.
+        if not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+            self._access_key_id = (
+                settings.aws_access_key_id.get_secret_value()
+                if settings.aws_access_key_id
+                else None
+            )
+            self._secret_access_key = (
+                settings.aws_secret_access_key.get_secret_value()
+                if settings.aws_secret_access_key
+                else None
+            )
         self._client: Any | None = None
 
     def _get_client(self) -> Any:
